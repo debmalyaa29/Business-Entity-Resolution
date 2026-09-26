@@ -98,3 +98,18 @@ def extract_numbers(text: str) -> Set[str]:
     if not text:
         return set()
     return set(DIGIT_REGEX.findall(text))
+
+ADDRESS_STOPWORDS = {
+    "road", "street", "avenue", "boulevard", "drive", "lane", "highway",
+    "apartment", "suite", "floor", "building", "square", "opposite", "near",
+    "number", "cross", "main", "phase", "sector", "block", "plot", "nagar",
+    "colony", "layout", "rue", "voie", "place", "allee", "and", "the", "of",
+    "in", "at", "to", "by", "for", "with", "de", "la", "le", "des", "du"
+}
+
+def extract_distinctive_address_tokens(clean_addr: str) -> Set[str]:
+    """Extract distinctive address tokens excluding generic road and location terms."""
+    tokens = extract_tokens(clean_addr, min_len=4)
+    distinctive = {t for t in tokens if t not in ADDRESS_STOPWORDS and not t.isdigit()}
+    return distinctive
+

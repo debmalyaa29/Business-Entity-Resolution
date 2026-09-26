@@ -10,6 +10,7 @@ from src.text_normalization import (
     clean_address,
     extract_tokens,
     extract_distinctive_name_tokens,
+    extract_distinctive_address_tokens,
     extract_numbers
 )
 
@@ -31,6 +32,7 @@ def generate_blocking_keys(
     clean_addr = clean_address(business_address)
     name_tokens = extract_distinctive_name_tokens(core_name)
     addr_tokens = extract_tokens(clean_addr, min_len=3)
+    dist_addr_tokens = extract_distinctive_address_tokens(clean_addr)
     numbers = extract_numbers(clean_addr)
 
     # 1. Exact core name in country (high precision)
@@ -42,13 +44,24 @@ def generate_blocking_keys(
         if len(tok) >= 4:
             keys.add(f"NAME_TOK:{norm_country}:{tok}")
 
-    # 3. Name prefix (3 chars) + Address number/PIN (if available)
+    # 3. PRE4 / 4-character normalized core name prefix (captures spelling/suffix variants)
+    if len(core_name) >= 4:
+        keys.add(f"PRE4:{norm_country}:{core_name[:4]}")
+
+    # 4. Name prefix (3 chars) + Address number/PIN (if available)
     prefix3 = core_name[:3] if len(core_name) >= 3 else core_name
     if prefix3:
         for num in numbers:
             keys.add(f"PRE_NUM:{norm_country}:{prefix3}:{num}")
 
-    # 4. Clean address exact match (for exact location matches)
+    # 5. Distinctive address tokens + numbers/PINs
+    for atok in dist_addr_tokens:
+        for num in numbers:
+            keys.add(f"ADDR_TOK_NUM:{norm_country}:{atok}:{num}")
+        if len(atok) >= 5:
+            keys.add(f"ADDR_TOK:{norm_country}:{atok}")
+
+    # 6. Clean address exact match (for exact location matches)
     if clean_addr and len(clean_addr) >= 8:
         keys.add(f"ADDR_EXACT:{norm_country}:{clean_addr[:30]}")
 

@@ -1,0 +1,20 @@
+{
+  "candidate_recall": 0.9567409572524662,
+  "optimal_threshold": 0.85,
+  "validation_macro_f05": 0.9199573087591817,
+  "val_precision": 0.9353930446693555,
+  "val_recall": 0.8982097186700767,
+  "pairwise_accuracy": 0.9936393389538447,
+  "tp": 12292,
+  "fp": 849,
+  "fn": 1393,
+  "tn": 245465,
+  "n_train_s1": 20000,
+  "n_val_s1": 4000,
+  "n_train_pairs": 163706,
+  "pos_pairs": 69179,
+  "neg_pairs": 94527,
+  "total_val_candidates": 259407,
+  "training_time_sec": 66.36619591712952,
+  "peak_ram_mb": 941.02734375
+}

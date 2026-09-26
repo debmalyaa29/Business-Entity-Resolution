@@ -201,19 +201,34 @@ def run_training_pipeline(
     print(f"Optimal Threshold on Validation         : {best_thresh:.2f}")
     print(f"Best Validation Macro F_0.5             : {best_val_f05:.4f}")
 
-    # Calculate Pair Precision and Recall at best threshold
+    # Calculate Pair Precision, Recall, and Accuracy at best threshold
     total_pred = 0
-    total_tp = 0
+    tp = 0
+    fp = 0
     total_true_pairs = sum(len(m) for m in val_gt.values())
     for s1_id, cands in val_candidate_scores.items():
         preds = {cid for cid, score in cands if score >= best_thresh}
+        true_set = val_gt.get(s1_id, set())
+        for cid in preds:
+            if cid in true_set:
+                tp += 1
+            else:
+                fp += 1
         total_pred += len(preds)
-        total_tp += len(preds & val_gt.get(s1_id, set()))
 
-    val_precision = total_tp / total_pred if total_pred > 0 else 0.0
-    val_recall = total_tp / total_true_pairs if total_true_pairs > 0 else 0.0
-    print(f"Pair Precision at Optimal Threshold     : {val_precision:.4f} ({total_tp}/{total_pred})")
-    print(f"Pair Recall at Optimal Threshold        : {val_recall:.4f} ({total_tp}/{total_true_pairs})")
+    fn = total_true_pairs - tp
+    # True negatives among evaluated candidates
+    tn = total_val_cands - (tp + fp + (int(cand_recall * total_true_pairs) - tp))
+    if tn < 0:
+        tn = max(0, total_val_cands - (tp + fp))
+    pairwise_acc = (tp + tn) / max(1, total_val_cands)
+
+    val_precision = tp / total_pred if total_pred > 0 else 0.0
+    val_recall = tp / total_true_pairs if total_true_pairs > 0 else 0.0
+    print(f"Pair Precision at Optimal Threshold     : {val_precision:.4f} ({tp}/{total_pred})")
+    print(f"Pair Recall at Optimal Threshold        : {val_recall:.4f} ({tp}/{total_true_pairs})")
+    print(f"Pairwise Binary Classification Accuracy : {pairwise_acc:.4%} ({tp + tn:,} / {total_val_cands:,})")
+    print(f"Confusion Matrix: TP={tp:,}, FP={fp:,}, FN={fn:,}, TN={tn:,}")
 
     # Track runtime and memory
     import resource
@@ -223,8 +238,8 @@ def run_training_pipeline(
     print(f"Peak Memory Usage                       : {peak_ram_mb:.1f} MB")
 
     # Save model and metrics to experiment files
-    exp_model_path = config.ARTIFACT_DIR / "matching_model_exp_20k_b500_c65.json"
-    exp_metrics_path = config.ARTIFACT_DIR / "validation_metrics_exp_20k_b500_c65.json"
+    exp_model_path = config.ARTIFACT_DIR / "matching_model_exp_blocking_pre4.json"
+    exp_metrics_path = config.ARTIFACT_DIR / "validation_metrics_exp_blocking_pre4.json"
     model.save(exp_model_path)
     print(f"Experiment model saved to {exp_model_path}.")
 
@@ -234,6 +249,11 @@ def run_training_pipeline(
         "validation_macro_f05": float(best_val_f05),
         "val_precision": float(val_precision),
         "val_recall": float(val_recall),
+        "pairwise_accuracy": float(pairwise_acc),
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tn": int(tn),
         "n_train_s1": len(train_s1_ids),
         "n_val_s1": len(val_s1_ids),
         "n_train_pairs": int(len(X_train)),
