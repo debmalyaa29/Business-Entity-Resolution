@@ -17,7 +17,7 @@ from src.model import EntityMatchingModel
 
 def run_test_inference(
     threshold: float = 0.50,
-    max_candidates_per_entity: int = 30,
+    max_candidates_per_entity: int = 65,
     batch_size: int = 5000
 ):
     print("=" * 60)
@@ -43,8 +43,9 @@ def run_test_inference(
     print(f"Applying decision threshold: {threshold:.2f}")
 
     # 2. Build Candidate Index from Test Source 2 and Source 3
-    print("\n[2/4] Indexing Test Source 2 and Source 3...")
-    test_index = BlockingIndex(max_bucket_size=120)
+    print("\n[2/4] Indexing Test Source 2 and Source 3 (Country Partitioned)...")
+    from src.blocking import CountryPartitionedBlockingIndex
+    test_index = CountryPartitionedBlockingIndex(max_bucket_size=500)
 
     usecols = [config.ENTITY_ID_COL, config.BUSINESS_NAME_COL, config.BUSINESS_ADDRESS_COL, config.COUNTRY_COL]
     for label, path in [("Test Source 2", config.TEST_SOURCE2), ("Test Source 3", config.TEST_SOURCE3)]:
@@ -55,7 +56,7 @@ def run_test_inference(
                 count += 1
         print(f"  Indexed {count:,} records from {label}.")
 
-    print(f"Total candidate pool indexed: {len(test_index.entity_records):,} records.")
+    print(f"Total candidate pool indexed across {len(test_index.partitions)} country partitions: {test_index.total_entities:,} records.")
 
     # 3. Stream Test Source 1 and generate predictions
     print(f"\n[3/4] Streaming Test Source 1 and generating candidate pairs & matches...")
@@ -102,8 +103,8 @@ def run_test_inference(
             feat_batch = []
             cand_ids = []
             for cid, hits in cand_with_hits:
-                if cid in test_index.entity_records:
-                    crec = test_index.entity_records[cid]
+                crec = test_index.get_entity_record(cid, s1_rec[3])
+                if crec is not None:
                     feats = extract_pairwise_features(s1_rec, cid, crec, blocking_hits=hits)
                     feat_batch.append(feats)
                     cand_ids.append(cid)

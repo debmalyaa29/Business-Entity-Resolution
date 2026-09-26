@@ -132,3 +132,74 @@ class BlockingIndex:
             max_candidates=max_candidates
         )
         return [cand_id for cand_id, _ in ranked]
+
+class CountryPartitionedBlockingIndex:
+    """
+    Partitioned inverted index storing candidates grouped by country.
+    Ensures cross-country isolation and strictly limits peak memory by
+    allowing per-country loading, querying, and eviction.
+    """
+    def __init__(self, max_bucket_size: int = 500):
+        self.max_bucket_size = max_bucket_size
+        self.partitions: Dict[str, BlockingIndex] = {}
+
+    def get_partition(self, country: str) -> BlockingIndex:
+        norm = (country or "").strip().upper() or "UNKNOWN"
+        if norm not in self.partitions:
+            self.partitions[norm] = BlockingIndex(max_bucket_size=self.max_bucket_size)
+        return self.partitions[norm]
+
+    def add_entity(self, entity_id: str, business_name: str, business_address: str, country: str):
+        part = self.get_partition(country)
+        part.add_entity(entity_id, business_name, business_address, country)
+
+    def get_candidates_with_hits(
+        self,
+        business_name: str,
+        business_address: str,
+        country: str,
+        max_candidates: int = 65
+    ) -> List[Tuple[str, int]]:
+        norm = (country or "").strip().upper() or "UNKNOWN"
+        if norm not in self.partitions:
+            return []
+        return self.partitions[norm].get_candidates_with_hits(
+            business_name=business_name,
+            business_address=business_address,
+            country=country,
+            max_candidates=max_candidates
+        )
+
+    def get_candidates(
+        self,
+        business_name: str,
+        business_address: str,
+        country: str,
+        max_candidates: int = 65
+    ) -> List[str]:
+        ranked = self.get_candidates_with_hits(
+            business_name=business_name,
+            business_address=business_address,
+            country=country,
+            max_candidates=max_candidates
+        )
+        return [cand_id for cand_id, _ in ranked]
+
+    def get_entity_record(self, entity_id: str, country: str = ""):
+        if country:
+            norm = (country or "").strip().upper() or "UNKNOWN"
+            if norm in self.partitions and entity_id in self.partitions[norm].entity_records:
+                return self.partitions[norm].entity_records[entity_id]
+        for part in self.partitions.values():
+            if entity_id in part.entity_records:
+                return part.entity_records[entity_id]
+        return None
+
+    def clear_country(self, country: str):
+        norm = (country or "").strip().upper() or "UNKNOWN"
+        if norm in self.partitions:
+            del self.partitions[norm]
+
+    @property
+    def total_entities(self) -> int:
+        return sum(len(p.entity_records) for p in self.partitions.values())
