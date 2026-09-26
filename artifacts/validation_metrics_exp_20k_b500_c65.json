@@ -1,0 +1,15 @@
+{
+  "candidate_recall": 0.8127146510778225,
+  "optimal_threshold": 0.85,
+  "validation_macro_f05": 0.8713090880591127,
+  "val_precision": 0.9382051727130707,
+  "val_recall": 0.7899159663865546,
+  "n_train_s1": 20000,
+  "n_val_s1": 4000,
+  "n_train_pairs": 161488,
+  "pos_pairs": 69179,
+  "neg_pairs": 92309,
+  "total_val_candidates": 237575,
+  "training_time_sec": 53.56040048599243,
+  "peak_ram_mb": 727.140625
+}

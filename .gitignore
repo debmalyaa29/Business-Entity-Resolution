@@ -1,0 +1,35 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datasets and generated TSV / data files
+dataset/
+output/
+*.tsv
+*.csv
+
+# Submission archives
+*.zip
+
+# Large artifacts and cache files
+artifacts/large_*
+*.parquet
+*.pkl
+*.bin
+
+# Environment & Virtualenvs
+.env
+.venv/
+venv/
+env/
+conda-env/
+
+# Logs
+*.log
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

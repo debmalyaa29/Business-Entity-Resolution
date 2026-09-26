@@ -1,0 +1,10 @@
+{
+  "candidate_recall": 0.8757961783439491,
+  "optimal_threshold": 0.85,
+  "validation_macro_f05": 0.9311425155861215,
+  "n_train_s1": 1000,
+  "n_val_s1": 200,
+  "n_train_pairs": 7695,
+  "pos_pairs": 3483,
+  "neg_pairs": 4212
+}
