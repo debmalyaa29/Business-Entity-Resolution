@@ -1,7 +1,7 @@
 """
 Full-Dataset Training Pipeline for Amazon ML Challenge 2026 Business Entity Resolution.
 Supports the complete 2.2M Source 1 population using:
-1. Country-partitioned target indexing for strict memory safety (< 1 GB RAM).
+1. DiskBackedBlockingIndex (SQLite B-Tree) for strict memory safety (< 500 MB RAM).
 2. Streaming chunked processing of Source 1 (chunk size = 50,000).
 3. Ground-truth positive extraction + hard negative mining from realistic blocking collisions.
 4. Cumulative global float32 feature matrix persistence (no naive model overwrite).
@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from src import config
-from src.blocking import BlockingIndex, generate_blocking_keys
+from src.blocking import DiskBackedBlockingIndex, generate_blocking_keys
 from src.data_loader import stream_tsv_chunks
 from src.evaluate import compute_macro_f05
 from src.features import extract_pairwise_features
@@ -83,38 +83,37 @@ def run_full_training(
     chunk_size: int = 50000,
     max_bucket_size: int = 500,
     max_candidates: int = 65,
-    max_negatives_per_entity: int = 2
+    max_negatives_per_entity: int = 2,
+    max_train_pairs_target: int = 400000
 ):
     start_total_time = time.time()
     print("=" * 70)
     print("AMAZON ML CHALLENGE — FULL DATASET TRAINING PIPELINE (2.2M S1)")
     print(f"Validation Holdout: {val_size:,} S1 entities | Chunk Size: {chunk_size:,}")
     print(f"Max Bucket Size: {max_bucket_size} | Max Candidates: {max_candidates}")
+    print(f"Target Global Training Pairs: {max_train_pairs_target:,}")
     print("=" * 70)
 
-    # 1. Inspect ground truth count and split S1 IDs into train and validation
+    # 1. Compact Ground Truth Indexing (raw string values to save memory)
     print("\n[STEP 1/6] Indexing S1 entities and Ground Truth...")
-    gt_matches: Dict[str, Set[str]] = defaultdict(set)
+    gt_matches: Dict[str, str] = {}
     total_gt_rows = 0
     for chunk in stream_tsv_chunks(config.TRAIN_GROUND_TRUTH, chunk_size=100000):
         for s1_id, m_str in chunk.itertuples(index=False, name=None):
             total_gt_rows += 1
             if pd.notna(m_str) and str(m_str).strip():
-                for mid in str(m_str).split(","):
-                    mid = mid.strip()
-                    if mid:
-                        gt_matches[s1_id].add(mid)
+                gt_matches[s1_id] = str(m_str).strip()
 
     print(f"  Total Ground Truth S1 entities indexed: {total_gt_rows:,}")
     print(f"  Total non-singleton S1 entities in GT: {len(gt_matches):,}")
     print(f"  Current RAM: {get_peak_ram_mb():.1f} MB")
 
-    # Partition target files by country
+    # 2. Partition target files by country
     print("\n[STEP 2/6] Partitioning Target Training Records (S2 & S3) by Country...")
     part_dir = config.ARTIFACT_DIR / "train_partitions"
     countries = partition_target_files_by_country(config.TRAIN_SOURCE2, config.TRAIN_SOURCE3, part_dir)
 
-    # 3. Stream S1 and extract features country by country
+    # 3. Stream S1 and extract features country by country using DiskBackedBlockingIndex
     print("\n[STEP 3/6] Mining Positive Matches and Hard Negatives Country-by-Country...")
     all_X_chunks: List[np.ndarray] = []
     all_y_chunks: List[np.ndarray] = []
@@ -131,13 +130,24 @@ def run_full_training(
 
         print(f"\n  --- Processing Country: {country} ---")
         t_c_start = time.time()
-        c_index = BlockingIndex(max_bucket_size=max_bucket_size)
+        db_path = part_dir / f"index_{country}.db"
+        c_index = DiskBackedBlockingIndex(db_path, max_bucket_size=max_bucket_size)
 
-        for chunk in stream_tsv_chunks(target_file, chunk_size=100000):
+        batch = []
+        indexed_count = 0
+        for chunk in stream_tsv_chunks(target_file, chunk_size=50000):
             for eid, name, addr, c_code in chunk.itertuples(index=False, name=None):
-                c_index.add_entity(eid, str(name or ""), str(addr or ""), str(c_code or ""))
+                batch.append((eid, str(name or ""), str(addr or ""), str(c_code or "")))
+                if len(batch) >= 50000:
+                    c_index.add_entities_batch(batch)
+                    indexed_count += len(batch)
+                    batch = []
+        if batch:
+            c_index.add_entities_batch(batch)
+            indexed_count += len(batch)
+        c_index.finalize_index()
 
-        print(f"    Indexed {len(c_index.entity_records):,} target records for {country} in {time.time() - t_c_start:.1f}s (RAM: {get_peak_ram_mb():.1f} MB)")
+        print(f"    Indexed {indexed_count:,} target records into disk-backed B-Tree for {country} in {time.time() - t_c_start:.1f}s (RAM: {get_peak_ram_mb():.1f} MB)")
 
         # Stream S1 entities belonging to this country
         s1_country_count = 0
@@ -150,14 +160,15 @@ def run_full_training(
                 norm_c = (str(c_code or "")).strip().upper() or "UNKNOWN"
                 s1_idx += 1
 
-                # Reserve the last val_size entities for validation
+                # Reserve the last val_size entities across the dataset for validation
                 is_val = (s1_idx > (total_gt_rows - val_size))
                 if norm_c == country:
                     s1_country_count += 1
                     rec = (str(name or ""), str(name or ""), str(addr or ""), norm_c)
                     if is_val:
                         val_s1_records[eid] = rec
-                        val_gt[eid] = gt_matches.get(eid, set())
+                        m_str = gt_matches.get(eid, "")
+                        val_gt[eid] = set(m_str.split(",")) if m_str else set()
                     else:
                         s1_buffer.append((eid, rec))
 
@@ -166,18 +177,23 @@ def run_full_training(
                 chunk_X = []
                 chunk_y = []
                 for s1_id, s1_rec in s1_buffer:
-                    true_mids = gt_matches.get(s1_id, set())
+                    m_str = gt_matches.get(s1_id, "")
+                    true_mids = set(m_str.split(",")) if m_str else set()
+
                     cand_hits = c_index.get_candidates_with_hits(
                         business_name=s1_rec[0],
                         business_address=s1_rec[2],
                         country=s1_rec[3],
                         max_candidates=max_candidates
                     )
+                    cand_ids = [cid for cid, _ in cand_hits]
+                    needed_ids = list(set(cand_ids + list(true_mids)))
+                    recs_map = c_index.get_records_batch(needed_ids)
 
                     # Positives
                     for t_id in true_mids:
-                        if t_id in c_index.entity_records:
-                            crec = c_index.entity_records[t_id]
+                        if t_id in recs_map:
+                            crec = recs_map[t_id]
                             hits = next((h for cid, h in cand_hits if cid == t_id), 1)
                             feats = extract_pairwise_features(s1_rec, t_id, crec, blocking_hits=hits)
                             chunk_X.append(feats)
@@ -187,8 +203,8 @@ def run_full_training(
                     # Hard Negatives
                     neg_added = 0
                     for cid, hits in cand_hits:
-                        if cid not in true_mids and cid in c_index.entity_records:
-                            crec = c_index.entity_records[cid]
+                        if cid not in true_mids and cid in recs_map:
+                            crec = recs_map[cid]
                             feats = extract_pairwise_features(s1_rec, cid, crec, blocking_hits=hits)
                             chunk_X.append(feats)
                             chunk_y.append(0)
@@ -204,20 +220,31 @@ def run_full_training(
                 s1_buffer = []
                 gc.collect()
 
-        if s1_buffer:
+                # If global pairs exceed target budget, stop mining to keep model fit fast & bounded
+                if (total_positives + total_negatives) >= max_train_pairs_target:
+                    print(f"    Reached target training population sample ({total_positives + total_negatives:,} pairs).")
+                    break
+
+        if s1_buffer and (total_positives + total_negatives) < max_train_pairs_target:
             chunk_X = []
             chunk_y = []
             for s1_id, s1_rec in s1_buffer:
-                true_mids = gt_matches.get(s1_id, set())
+                m_str = gt_matches.get(s1_id, "")
+                true_mids = set(m_str.split(",")) if m_str else set()
+
                 cand_hits = c_index.get_candidates_with_hits(
                     business_name=s1_rec[0],
                     business_address=s1_rec[2],
                     country=s1_rec[3],
                     max_candidates=max_candidates
                 )
+                cand_ids = [cid for cid, _ in cand_hits]
+                needed_ids = list(set(cand_ids + list(true_mids)))
+                recs_map = c_index.get_records_batch(needed_ids)
+
                 for t_id in true_mids:
-                    if t_id in c_index.entity_records:
-                        crec = c_index.entity_records[t_id]
+                    if t_id in recs_map:
+                        crec = recs_map[t_id]
                         hits = next((h for cid, h in cand_hits if cid == t_id), 1)
                         feats = extract_pairwise_features(s1_rec, t_id, crec, blocking_hits=hits)
                         chunk_X.append(feats)
@@ -226,8 +253,8 @@ def run_full_training(
 
                 neg_added = 0
                 for cid, hits in cand_hits:
-                    if cid not in true_mids and cid in c_index.entity_records:
-                        crec = c_index.entity_records[cid]
+                    if cid not in true_mids and cid in recs_map:
+                        crec = recs_map[cid]
                         feats = extract_pairwise_features(s1_rec, cid, crec, blocking_hits=hits)
                         chunk_X.append(feats)
                         chunk_y.append(0)
@@ -243,7 +270,11 @@ def run_full_training(
             gc.collect()
 
         print(f"    Finished {country}: processed {s1_country_count:,} S1 entities. Pairs so far: Pos={total_positives:,}, Neg={total_negatives:,}")
-        del c_index
+        c_index.close()
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
         gc.collect()
 
     print(f"\n  Cumulative training pairs mined: Positives={total_positives:,}, Hard Negatives={total_negatives:,}, Total={total_positives + total_negatives:,}")
@@ -268,7 +299,6 @@ def run_full_training(
     model.save(config.MODEL_PATH)
     print(f"  Model saved to {config.MODEL_PATH}.")
 
-    # Free training matrix before validation
     del X_train, y_train
     gc.collect()
 
@@ -280,7 +310,6 @@ def run_full_training(
     found_true_pairs = 0
     total_true_pairs = sum(len(m) for m in val_gt.values())
 
-    # Evaluate validation country by country to keep memory bounded
     val_by_country: Dict[str, List[str]] = defaultdict(list)
     for eid, rec in val_s1_records.items():
         val_by_country[rec[3]].append(eid)
@@ -292,10 +321,19 @@ def run_full_training(
                 val_cand_scores[eid] = []
             continue
 
-        c_index = BlockingIndex(max_bucket_size=max_bucket_size)
-        for chunk in stream_tsv_chunks(target_file, chunk_size=100000):
-            for tid, name, addr, c_code in chunk.itertuples(index=False, name=None):
-                c_index.add_entity(tid, str(name or ""), str(addr or ""), str(c_code or ""))
+        db_path = part_dir / f"val_index_{country}.db"
+        c_index = DiskBackedBlockingIndex(db_path, max_bucket_size=max_bucket_size)
+
+        batch = []
+        for chunk in stream_tsv_chunks(target_file, chunk_size=50000):
+            for eid, name, addr, c_code in chunk.itertuples(index=False, name=None):
+                batch.append((eid, str(name or ""), str(addr or ""), str(c_code or "")))
+                if len(batch) >= 50000:
+                    c_index.add_entities_batch(batch)
+                    batch = []
+        if batch:
+            c_index.add_entities_batch(batch)
+        c_index.finalize_index()
 
         for eid in eids:
             s1_rec = val_s1_records[eid]
@@ -316,14 +354,17 @@ def run_full_training(
                 val_cand_scores[eid] = []
                 continue
 
+            cand_ids = [cid for cid, _ in cand_hits]
+            recs_map = c_index.get_records_batch(cand_ids)
+
             feat_batch = []
-            cand_ids = []
+            valid_cand_ids = []
             for cid, hits in cand_hits:
-                if cid in c_index.entity_records:
-                    crec = c_index.entity_records[cid]
+                if cid in recs_map:
+                    crec = recs_map[cid]
                     feats = extract_pairwise_features(s1_rec, cid, crec, blocking_hits=hits)
                     feat_batch.append(feats)
-                    cand_ids.append(cid)
+                    valid_cand_ids.append(cid)
 
             if not feat_batch:
                 val_cand_scores[eid] = []
@@ -331,9 +372,13 @@ def run_full_training(
 
             X_b = np.array(feat_batch, dtype=np.float32)
             probs = model.predict_proba(X_b)
-            val_cand_scores[eid] = list(zip(cand_ids, probs))
+            val_cand_scores[eid] = list(zip(valid_cand_ids, probs))
 
-        del c_index
+        c_index.close()
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
         gc.collect()
 
     cand_recall = found_true_pairs / max(1, total_true_pairs)
@@ -365,7 +410,6 @@ def run_full_training(
     print(f"  Optimal Decision Threshold       : {best_thresh:.2f}")
     print(f"  Best Validation Macro F_0.5      : {best_val_f05:.4f}")
 
-    # Precision, Recall, Accuracy at best threshold
     tp, fp = 0, 0
     total_preds = 0
     for eid, cands in val_cand_scores.items():
@@ -388,7 +432,6 @@ def run_full_training(
     print(f"  Pair Recall                      : {pair_recall:.4f} ({tp:,}/{total_true_pairs:,})")
     print(f"  Diagnostic Pairwise Accuracy     : {pairwise_acc:.4%} (TP={tp:,}, FP={fp:,}, FN={fn:,}, TN={tn:,})")
 
-    # Save metrics
     metrics = {
         "candidate_recall": float(cand_recall),
         "optimal_threshold": float(best_thresh),
@@ -419,7 +462,6 @@ def run_full_training(
         json.dump(metrics, f, indent=2)
     print(f"  Saved validation metrics to {config.METRICS_PATH}.")
 
-    # 6. Cleanup temporary train partitions
     print("\n[STEP 6/6] Cleaning Up Temporary Training Partitions...")
     shutil.rmtree(part_dir, ignore_errors=True)
     print(f"  Cleaned {part_dir}.")

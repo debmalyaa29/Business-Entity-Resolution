@@ -138,13 +138,22 @@ def run_test_inference(
 
         print(f"\n  --- Running Inference for Country: {country} ---")
         t_c_start = time.time()
-        c_index = BlockingIndex(max_bucket_size=500)
+        db_path = target_part_dir / f"test_index_{country}.db"
+        from src.blocking import DiskBackedBlockingIndex
+        c_index = DiskBackedBlockingIndex(db_path, max_bucket_size=max_candidates_per_entity)
 
         if target_file.is_file():
-            for chunk in stream_tsv_chunks(target_file, chunk_size=100000):
+            batch = []
+            for chunk in stream_tsv_chunks(target_file, chunk_size=50000):
                 for tid, name, addr, c_code in chunk.itertuples(index=False, name=None):
-                    c_index.add_entity(tid, str(name or ""), str(addr or ""), str(c_code or ""))
-            print(f"    Indexed {len(c_index.entity_records):,} target records for {country} in {time.time() - t_c_start:.1f}s.")
+                    batch.append((tid, str(name or ""), str(addr or ""), str(c_code or "")))
+                    if len(batch) >= 50000:
+                        c_index.add_entities_batch(batch)
+                        batch = []
+            if batch:
+                c_index.add_entities_batch(batch)
+            c_index.finalize_index()
+            print(f"    Indexed target records into disk-backed B-Tree for {country} in {time.time() - t_c_start:.1f}s.")
         else:
             print(f"    Notice: No target records found for country {country} (all will be singletons).")
 
@@ -174,14 +183,17 @@ def run_test_inference(
                     total_singletons += 1
                     continue
 
+                cand_ids = [cid for cid, _ in cand_hits]
+                recs_map = c_index.get_records_batch(cand_ids)
+
                 feat_batch = []
-                cand_ids = []
+                valid_cands = []
                 for cid, hits in cand_hits:
-                    if cid in c_index.entity_records:
-                        crec = c_index.entity_records[cid]
+                    if cid in recs_map:
+                        crec = recs_map[cid]
                         feats = extract_pairwise_features(s1_rec, cid, crec, blocking_hits=hits)
                         feat_batch.append(feats)
-                        cand_ids.append(cid)
+                        valid_cands.append(cid)
 
                 if not feat_batch:
                     out_pred.write(f"{l_num}\t{s1_id}\t\t{cand_str}\n")
@@ -190,7 +202,7 @@ def run_test_inference(
 
                 X_b = np.array(feat_batch, dtype=np.float32)
                 probs = model.predict_proba(X_b)
-                matched = [cand_ids[i] for i, p in enumerate(probs) if p >= threshold]
+                matched = [valid_cands[i] for i, p in enumerate(probs) if p >= threshold]
                 unique_matched = list(dict.fromkeys(matched))
                 match_str = ",".join(unique_matched)
 
@@ -204,8 +216,12 @@ def run_test_inference(
             gc.collect()
 
         out_pred.close()
+        c_index.close()
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
         print(f"    Completed {country}: processed {country_s1_count:,} entities (Peak RAM: {get_peak_ram_mb():.1f} MB)")
-        del c_index
         gc.collect()
 
     # 5. Assemble Final Files Preserving Exact Test S1 Row Order

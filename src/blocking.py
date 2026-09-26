@@ -4,6 +4,8 @@ Constructs inverted indices over multi-pass blocking keys to retrieve high-recal
 """
 
 from collections import defaultdict
+from pathlib import Path
+import sqlite3
 from typing import Dict, List, Set, Tuple, Iterator
 from src.text_normalization import (
     clean_business_name,
@@ -39,8 +41,9 @@ def generate_blocking_keys(
     if core_name and len(core_name) >= 3:
         keys.add(f"NAME_CORE:{norm_country}:{core_name}")
 
-    # 2. Distinctive name tokens (for word order changes, variations)
-    for tok in name_tokens:
+    # 2. Distinctive name tokens (for word order changes, variations - top 2 longest)
+    sorted_name_toks = sorted(name_tokens, key=len, reverse=True)[:2]
+    for tok in sorted_name_toks:
         if len(tok) >= 4:
             keys.add(f"NAME_TOK:{norm_country}:{tok}")
 
@@ -48,15 +51,17 @@ def generate_blocking_keys(
     if len(core_name) >= 4:
         keys.add(f"PRE4:{norm_country}:{core_name[:4]}")
 
-    # 4. Name prefix (3 chars) + Address number/PIN (if available)
+    # 4. Name prefix (3 chars) + Address number/PIN (if available - top 2 numbers)
     prefix3 = core_name[:3] if len(core_name) >= 3 else core_name
+    sorted_nums = sorted(numbers, key=len, reverse=True)[:2]
     if prefix3:
-        for num in numbers:
+        for num in sorted_nums:
             keys.add(f"PRE_NUM:{norm_country}:{prefix3}:{num}")
 
-    # 5. Distinctive address tokens + numbers/PINs
-    for atok in dist_addr_tokens:
-        for num in numbers:
+    # 5. Distinctive address tokens + numbers/PINs (top 2 distinctive tokens & top 2 numbers)
+    sorted_addr_toks = sorted(dist_addr_tokens, key=len, reverse=True)[:2]
+    for atok in sorted_addr_toks:
+        for num in sorted_nums:
             keys.add(f"ADDR_TOK_NUM:{norm_country}:{atok}:{num}")
         if len(atok) >= 5:
             keys.add(f"ADDR_TOK:{norm_country}:{atok}")
@@ -203,3 +208,77 @@ class CountryPartitionedBlockingIndex:
     @property
     def total_entities(self) -> int:
         return sum(len(p.entity_records) for p in self.partitions.values())
+
+class DiskBackedBlockingIndex:
+    """
+    High-performance disk-backed blocking index powered by SQLite.
+    Stores records and inverted index on disk, keeping RAM bounded (< 100 MB)
+    even for tens of millions of records.
+    """
+    def __init__(self, db_path: Path, max_bucket_size: int = 500):
+        self.db_path = Path(db_path)
+        self.max_bucket_size = max_bucket_size
+        self._init_db()
+
+    def _init_db(self):
+        if self.db_path.exists():
+            try:
+                self.db_path.unlink()
+            except Exception:
+                pass
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn.execute("PRAGMA synchronous = OFF")
+        self.conn.execute("PRAGMA journal_mode = OFF")
+        self.conn.execute("PRAGMA temp_store = MEMORY")
+        self.conn.execute("PRAGMA cache_size = -64000")  # 64 MB page cache
+        self.conn.execute("CREATE TABLE records (id TEXT PRIMARY KEY, name TEXT, addr TEXT)")
+        self.conn.execute("CREATE TABLE blk (key TEXT, id TEXT)")
+
+    def add_entities_batch(self, batch: List[Tuple[str, str, str, str]]):
+        recs = []
+        blks = []
+        for eid, name, addr, country in batch:
+            recs.append((eid, str(name or ""), str(addr or "")))
+            keys = generate_blocking_keys(name, addr, country)
+            for k in keys:
+                blks.append((k, eid))
+        self.conn.executemany("INSERT OR IGNORE INTO records VALUES (?, ?, ?)", recs)
+        self.conn.executemany("INSERT INTO blk VALUES (?, ?)", blks)
+
+    def finalize_index(self):
+        self.conn.execute("CREATE INDEX idx_blk_key ON blk(key)")
+        self.conn.commit()
+
+    def get_candidates_with_hits(
+        self,
+        business_name: str,
+        business_address: str,
+        country: str,
+        max_candidates: int = 65
+    ) -> List[Tuple[str, int]]:
+        keys = list(generate_blocking_keys(business_name, business_address, country))
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        sql = f"""
+            SELECT id, COUNT(*) as hits
+            FROM blk
+            WHERE key IN ({placeholders})
+            GROUP BY id
+            ORDER BY hits DESC
+            LIMIT {max_candidates}
+        """
+        cur = self.conn.execute(sql, keys)
+        return cur.fetchall()
+
+    def get_records_batch(self, entity_ids: List[str]) -> Dict[str, Tuple[str, str]]:
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        sql = f"SELECT id, name, addr FROM records WHERE id IN ({placeholders})"
+        cur = self.conn.execute(sql, entity_ids)
+        return {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+
+    def close(self):
+        self.conn.close()
+
