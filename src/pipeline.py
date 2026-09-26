@@ -47,18 +47,12 @@ def execute_pipeline(dry_run: bool = False, skip_train: bool = False):
     if not skip_train:
         if dry_run:
             print("\n>>> STAGE 1: Training on dry-run sample...")
-            run_training_pipeline(
-                max_train_s1=2000,
-                max_val_s1=500,
-                max_s2_s3_load=20000
-            )
+            from src.test_small_e2e import run_small_e2e_test
+            run_small_e2e_test()
         else:
-            print("\n>>> STAGE 1: Training on full production sample...")
-            run_training_pipeline(
-                max_train_s1=50000,
-                max_val_s1=10000,
-                max_s2_s3_load=400000
-            )
+            print("\n>>> STAGE 1: Full-scale training across all 2.2M S1 entities...")
+            from src.train_full import run_full_training
+            run_full_training(val_size=50000, chunk_size=config.CHUNK_SIZE)
     else:
         print("\n>>> STAGE 1: Skipped (using existing trained model).")
 
